@@ -1,0 +1,328 @@
+<?php
+
+// set up the menu calls
+function rbge_cal_service_menu(){
+  
+    $items['rbge_service'] = array(
+        'title' => "Web Services",
+        'page callback' => 'rbge_cal_service',
+        'access callback' => true,
+        'type' => MENU_CALLBACK,
+    );
+    
+    $items['rbge_service_alerts'] = array(
+        'title' => "JSON of the active alerts.",
+        'page callback' => 'rbge_service_alerts',
+        'access callback' => true,
+        'type' => MENU_CALLBACK,
+    );
+    
+    $items['rbge_service_sync'] = array(
+        'title' => "JSON of events modified in the month before now or the date given.",
+        'page callback' => 'rbge_service_sync',
+        'page arguments' => array(1,2,3),
+        'access callback' => true,
+        'type' => MENU_CALLBACK,
+    );
+    
+    $items['rbge_service_cat_flags'] = array(
+        'title' => "JSON of all the categories and flags used in the Universal Calendar.",
+        'page callback' => 'rbge_service_cat_flags',
+        'page arguments' => array(),
+        'access callback' => true,
+        'type' => MENU_CALLBACK,
+    );
+    
+    $items['rbge_service_image'] = array(
+        'title' => "Returns image for base64 encoded path.",
+        'page callback' => 'rbge_service_image',
+        'page arguments' => array(
+            1
+        ),
+        'access callback' => true,
+        'type' => MENU_CALLBACK,
+    );
+    
+    return $items;
+}
+
+
+function rbge_cal_service(){
+    
+    $out = '<p>This is where we serve data for the main website (and maybe others) to consume.</p>';
+    $out .= '<p><strong>/rbge_service_alerts</strong> Returns JSON of the active alerts.</p>';
+    $out .= '<p><strong>/rbge_service_sync?since=&lt;timestamp&gt;</strong> Returns the events modified since &lt;timestamp&gt;. If &lt;timestamp&gt; is missing then last 24hrs is assumed. Maximum of 100 returned.</p>';
+    $out .= '<p><strong>/rbge_service_cat_flags</strong> Returns full descriptions of all the categories and flags in the system (not just those for publicly exposed events). This is somewhat expensive to call so please cache results.</p>';
+    $out .= '<p>Events included in the sync service are those that are:</p>';
+    $out .= '<ol>';
+    $out .= '<li>Confirmed or Cancelled (not Tentative).</li>';
+    $out .= '<li>In the Public Programme or Education categories or any of their children.</li>';
+    $out .= '<li>Flagged for promotion on the web.</li>';
+    $out .= "<li>Have an embargo date of before today or not set at all.</li>";
+    $out .= "<li>Have an image attached.</li>";
+    $out .= '</ol>';
+
+    return $out;
+    
+}
+
+function rbge_service_alerts(){
+    
+    $now = new DateTime();
+    
+    $out = array();
+    $out['title'] = 'RBGE Universal Calendar Active Alerts';
+    $out['date'] = $now->format(DATE_ATOM);
+    $out['timestamp'] = $now->getTimestamp();
+    $out['alerts'] = array();
+    
+    // find the nids of the active alerts
+    $sql = "SELECT c.entity_id as nid
+        FROM field_data_field_event_date as d
+        JOIN field_data_field_event_category as c on c.entity_id = d.entity_id
+        JOIN field_data_field_event_status as s on s.entity_id = d.entity_id
+        WHERE cast(utc_timestamp() AS DATETIME) >= CAST(d.field_event_date_value AS DATETIME)
+        AND CAST(utc_timestamp() AS DATETIME)   < CAST(d.field_event_date_value2 AS DATETIME)
+        AND c.field_event_category_tid >= 203 and c.field_event_category_tid <= 207
+        AND s.field_event_status_tid >= 12
+        GROUP BY c.entity_id;
+    ";
+    
+    $result = db_query($sql);
+    $event_nids = $result->fetchCol(0);
+    foreach($event_nids as $nid){
+        $event = entity_metadata_wrapper('node', node_load($nid));
+        $out['alerts'][] = rbge_cal_service_get_event($event);
+        dpm(node_load($nid));
+    }
+    
+    $out['alert_count'] = count($out['alerts']);
+            
+    //dpm($out); return 'banana';
+    drupal_json_output($out); drupal_exit();
+
+}
+
+function rbge_service_sync($year = false, $month = false, $day = false){
+
+    $now = new DateTime();
+    $out = array();
+    $out['title'] = 'RBGE Universal Calendar Events';
+    $out['date'] = $now->format(DATE_ATOM);
+    $out['timestamp'] = $now->getTimestamp();
+    $out['events'] = array();
+
+   // event category tids it must be in to get on the web
+   $cat_tids = array(
+        130, // public programme
+        7, // education
+   );
+   $terms = array_merge(taxonomy_get_tree(3, 130), taxonomy_get_tree(3, 7));
+   foreach($terms as $t){
+       $cat_tids[] = (int)$t->tid;
+   }
+   
+   // must be confirmed or cancelled
+   $statuses = array(12, 13);
+
+    // work out when to start out
+    if(isset($_GET['since'])){
+        $since = $_GET['since'];
+        $out['basis_of_since'] = 'GET parameter';
+    }else{
+        $since = $now->getTimestamp() - 60*60*24; // get changed in last 24 hours.
+        $out['basis_of_since'] = 'Default';
+    }
+    
+    $till = $since;
+
+    $query = new EntityFieldQuery();
+
+    $query->entityCondition('entity_type', 'node')
+      ->entityCondition('bundle', 'event')
+      ->propertyCondition('status', NODE_PUBLISHED) // has to be published
+      ->propertyCondition('changed', $since, '>' ) // has to be changed since the set date
+      ->fieldCondition('field_event_category', 'tid', $cat_tids, 'in') // has to be in public programme or education
+      ->fieldCondition('field_event_status', 'tid', $statuses, 'in') // has to be confirmed or cancelled
+      ->fieldCondition('field_event_flags', 'tid', 142, '=') // has to have the web flag
+      ->fieldCondition('field_image', 'fid', 0, '>') // must have image
+      ->addTag('embargo_filter')
+      ->propertyOrderBy('changed', 'ASC')
+      ->range(0, 100)
+      ->addMetaData('account', user_load(1)); // Run the query as user 1.
+
+    $result = $query->execute();
+
+    if (isset($result['node'])) {
+      $event_nids = array_keys($result['node']);
+      foreach($event_nids as $nid){
+          $event = entity_metadata_wrapper('node', node_load($nid));
+          $out['events'][] = rbge_cal_service_get_event($event);
+          $till = (int)$event->changed->value();
+      }
+    }
+    
+    $out['event_count'] = count($out['events']);
+    $out['since'] = $since;
+    $out['till'] = $till;
+
+    ob_clean();
+    drupal_json_output($out); drupal_exit();
+    
+}
+
+function rbge_cal_service_query_embargo_filter_alter($query){
+    $query->leftJoin('field_data_field_embargo_date', 'ed', "node.nid = ed.entity_id");  
+    $today = date('Y-m-d');
+    $today = $today . 'T00:00:00';
+    $query->where("field_embargo_date_value is NULL OR field_embargo_date_value <= '$today'" );
+}
+
+function rbge_cal_service_get_event($event){
+    
+    global $base_url;
+    
+    $out = array();
+    
+    $out['id'] = $event->getIdentifier();
+    $out['title'] =  $event->title->value(array('sanitize' => TRUE));
+    $out['body'] =  $event->body->value();
+    if(isset($out['body']['value'])){
+        $out['body'] = $out['body']['value'];
+    }else{
+        $out['body'] = '';
+    }
+    $venue = $event->field_event_venue->value();
+    $out['venue'] = $venue->name;
+    $out['venue_id'] = $venue->tid;
+    
+    $terms = taxonomy_get_parents_all($venue->tid);
+    $terms = array_reverse($terms);
+    $garden_term = $terms[0];
+    
+    $out['garden'] = $garden_term->name;
+    $out['garden_id'] = $garden_term->tid;
+    
+    $start_times = $event->field_advertised_start_time->value();
+    $out['ad_start_times'] = array();
+    for($i = 0; $i < count($start_times); $i++){
+       $out['ad_start_times'][] = $start_times[$i];
+    }
+
+    $end_times = $event->field_advertised_end_time->value();
+    $out['ad_end_times'] = array();
+    for($i = 0; $i < count($end_times); $i++){
+        $out['ad_end_times'][] = $end_times[$i];
+    }
+
+    $dates = $event->field_event_date->value();
+    $out['dates'] = array();
+    for($i = 0; $i < count($dates); $i++){
+          $start = new DateTime($dates[$i]['value']);
+          $end = new DateTime($dates[$i]['value']);
+
+          $out['dates'][$i]['start_timestamp'] = $start->getTimestamp();
+          $out['dates'][$i]['start_date'] = $start->format(DATE_ATOM);
+
+          $out['dates'][$i]['end_timestamp'] = $end->getTimestamp();
+          $out['dates'][$i]['end_date'] = $end->format(DATE_ATOM);
+          $out['dates'][$i]['delta'] = $i;
+
+    }
+    
+    // categories are flags are merged as a concept - they are all just flags really
+    $out['cat_flags'] = array();
+
+    // flags
+    $flags = $event->field_event_flags->value();
+    for($i = 0; $i < count($flags); $i++){
+        $flag = $flags[$i];
+        if(!$flag) continue;
+        $out['cat_flags'][$i]['id'] = 'flag_' . $flag->tid;
+        $out['cat_flags'][$i]['name'] = $flag->name;
+        $out['cat_flags'][$i]['description'] = $flag->description;
+    }
+    
+    // categories
+    $cat = $event->field_event_category->value();
+    $i = count($out['cat_flags']);
+    $out['cat_flags'][$i]['id'] = 'cat_' . $cat->tid;
+    $out['cat_flags'][$i]['name'] = $cat->name;
+    $out['cat_flags'][$i]['description'] = $cat->description;
+    
+    // image
+    $image_data = $event->field_image->value();
+    if(count($image_data)){
+        $image_real_url = file_create_url($image_data['uri']);
+        $out['image_real_url'] = $image_real_url;
+        $out['image'] = $base_url . '/rbge_service_image/' . base64_encode($image_real_url);
+    }else{
+        $out['image_real_url'] = null;
+        $out['image'] = null;
+    }
+    
+    // tag with the modified time
+    $out['modified'] = $event->changed->value();
+   
+    $out['embargo_date_raw'] = $event->field_embargo_date->value();
+    
+    if($event->field_embargo_date->value()){
+        $embargo = new DateTime();
+        $embargo->setTimestamp(intval($event->field_embargo_date->value()));
+        $out['embargo_date'] = $embargo->format('Y-m-d');
+    }
+    
+    $out['booking_link'] = $event->field_booking_link->value();
+    
+    return $out;
+
+}
+
+function rbge_service_cat_flags(){
+    
+    $out = array();
+    $out['created'] = date(DATE_ATOM);
+
+    $event_voc = taxonomy_vocabulary_machine_name_load('event_category');
+    $out['categories'] = taxonomy_get_tree($event_voc->vid, 0, null, true);
+
+    $tag_voc = taxonomy_vocabulary_machine_name_load('tags');
+    $out['flags'] = taxonomy_get_tree($tag_voc->vid, 0, null, true);
+    
+    ob_clean();
+    drupal_json_output($out); drupal_exit();
+    
+}
+
+function rbge_service_image($encoded_url){
+    ob_clean();
+    $image_url = base64_decode($encoded_url);
+    
+	header_remove("Cache-Control");  // at request of D8
+	header_remove("Expires");  // at request of D8
+
+	// read the headers from the call - we will pinch some.
+	$headers = get_headers($image_url, 1);
+	
+	// must set the mod date for D8 cache to work
+	if(isset($headers['Last-Modified'])){
+		header('Last-Modified: '. $headers['Last-Modified']);
+	}else{
+		header('Last-Modified: '.gmdate('D, d M Y H:i:s', filemtime($image_url)).' GMT');
+	}
+
+	// set this if we have it
+	if(isset($headers['Content-Length'])){
+		header('Content-Length: '. $headers['Content-Length']);
+	}
+
+	// always jpg
+	header('Content-Type: image/jpeg');
+	
+	
+	readfile($image_url);
+	
+    exit();
+}
+
+?>

@@ -1,0 +1,5 @@
+name = "RBGE UniCal - Web Services"
+description = "Provides web service functionality"
+package = RBGE
+core = 7.x
+version = 7.x-1.0
